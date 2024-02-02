@@ -113,6 +113,17 @@ def process_batch(detections, labels, iouv):
     return torch.tensor(correct, dtype=torch.bool, device=iouv.device)
 
 
+def _make_grid(nx=20, ny=20, na = 4, anchor = None):
+    d = anchor.device
+    t = anchor.dtype
+    shape = 1, na, ny, nx, 2  # grid shape
+    y, x = torch.arange(ny, device=d, dtype=t), torch.arange(nx, device=d, dtype=t)
+    yv, xv = torch.meshgrid(y, x)  # torch>=0.7 compatibility
+    grid = torch.stack((xv, yv), 2).expand(shape) - 0.5  # add grid offset, i.e. y = 2.0 * x - 0.5
+    anchor_grid = anchor.view((1, na, 1, 1, 2)).expand(shape)
+    return grid, anchor_grid
+
+
 @smart_inference_mode()
 def run(
     data,
@@ -229,8 +240,37 @@ def run(
 
         # Inference
         with dt[1]:
-            preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
+            x_0, x_1, x_2 = model(im, augment=augment)
+            x = [x_0, x_1, x_2]
+            z = []
+            strides = [8, 16, 32]
+            anchor = torch.FloatTensor(np.array([[[10,13], [16,30], [33,23]],
+                        [[30,61], [62,45], [59,119]],
+                        [[116,90], [156,198], [373,326]]], dtype=np.float32))
+            anchor = anchor.to(device)
+            # print(anchor[1].shape)
+            anchor_grid = [torch.empty(0) for _ in range(3)]
+            grid = [torch.empty(0) for _ in range(3)]
 
+            for i in range(len(x)):
+                # print (x[i].shape)
+                bs, na, nx, ny, no = x[i].shape
+                # input_x = np.loadtxt(f"./result_{i}_tensor.txt", delimiter='\n')
+                # with open(f"./result_{i}_tensor.txt") as f:
+                #     output_value = [float(eachline.strip("\n")) for eachline in f]
+                # x[i] = torch.from_numpy(np.array(output_value).reshape((bs, na, nx, ny, no)))
+
+
+                # print(x[i].shape)
+
+                grid[i], anchor_grid[i] = _make_grid(nx, ny,na,  anchor[i])
+                xy, wh, conf = x[i].sigmoid().split((2, 2, 80 + 1), 4)
+                xy = (xy * 2 + grid[i]) * strides[i]  # xy
+                wh = (wh * 2) ** 2 * anchor_grid[i]  # wh
+                y = torch.cat((xy, wh, conf), 4)
+                z.append(y.view(bs, na * ny * nx, no))
+
+            preds, train_out = torch.cat(z, 1), None
         # Loss
         if compute_loss:
             loss += compute_loss(train_out, targets)[1]  # box, obj, cls
@@ -298,21 +338,21 @@ def run(
     nt = np.bincount(stats[3].astype(int), minlength=nc)  # number of targets per class
 
     # Print results
-    pf = "%22s" + "%11i" * 2 + "%11.3g" * 4  # print format
-    LOGGER.info(pf % ("all", seen, nt.sum(), mp, mr, map50, map))
-    if nt.sum() == 0:
-        LOGGER.warning(f"WARNING ⚠️ no labels found in {task} set, can not compute metrics without labels")
+    # pf = '%22s' + '%11i' * 2 + '%11.3g' * 4  # print format
+    # LOGGER.info(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
+    # if nt.sum() == 0:
+    #     LOGGER.warning(f'WARNING ⚠️ no labels found in {task} set, can not compute metrics without labels')
 
     # Print results per class
-    if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
-        for i, c in enumerate(ap_class):
-            LOGGER.info(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i]))
+    # if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
+    #     for i, c in enumerate(ap_class):
+    #         LOGGER.info(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i]))
 
     # Print speeds
-    t = tuple(x.t / seen * 1e3 for x in dt)  # speeds per image
-    if not training:
-        shape = (batch_size, 3, imgsz, imgsz)
-        LOGGER.info(f"Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {shape}" % t)
+    # t = tuple(x.t / seen * 1E3 for x in dt)  # speeds per image
+    # if not training:
+    #     shape = (batch_size, 3, imgsz, imgsz)
+    #     LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {shape}' % t)
 
     # Plots
     if plots:
@@ -320,60 +360,55 @@ def run(
         callbacks.run("on_val_end", nt, tp, fp, p, r, f1, ap, ap50, ap_class, confusion_matrix)
 
     # Save JSON
-    if save_json and len(jdict):
-        w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ""  # weights
-        # anno_json = str(Path("../datasets/coco/annotations/instances_val2017.json"))  # annotations
-        anno_json = str(Path("/mnt/share_disk/cdd/model_prune/datasets/coco/annotations/instances_val2017.json"))
-        print("======  anno json path is ", anno_json)
-        if not os.path.exists(anno_json):
-            anno_json = os.path.join(data["path"], "annotations", "instances_val2017.json")
-        pred_json = str(save_dir / f"{w}_predictions.json")  # predictions
-        LOGGER.info(f"\nEvaluating pycocotools mAP... saving {pred_json}...")
-        with open(pred_json, "w") as f:
-            json.dump(jdict, f)
+    # if save_json and len(jdict):
+    #     w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ""  # weights
+    #     anno_json = str(Path("../datasets/coco/annotations/instances_val2017.json"))  # annotations
+    #     if not os.path.exists(anno_json):
+    #         anno_json = os.path.join(data["path"], "annotations", "instances_val2017.json")
+    #     pred_json = str(save_dir / f"{w}_predictions.json")  # predictions
+    #     LOGGER.info(f"\nEvaluating pycocotools mAP... saving {pred_json}...")
+    #     with open(pred_json, "w") as f:
+    #         json.dump(jdict, f)
 
-        try:  # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
-            check_requirements("pycocotools>=2.0.6")
-            from pycocotools.coco import COCO
-            from pycocotools.cocoeval import COCOeval
+        # try:  # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
+        #     check_requirements("pycocotools>=2.0.6")
+        #     from pycocotools.coco import COCO
+        #     from pycocotools.cocoeval import COCOeval
 
-            anno = COCO(anno_json)  # init annotations api
-            pred = anno.loadRes(pred_json)  # init predictions api
-            eval = COCOeval(anno, pred, "bbox")
-            if is_coco:
-                eval.params.imgIds = [int(Path(x).stem) for x in dataloader.dataset.im_files]  # image IDs to evaluate
-            eval.evaluate()
-            eval.accumulate()
-            eval.summarize()
-            map, map50 = eval.stats[:2]  # update results (mAP@0.5:0.95, mAP@0.5)
-        except Exception as e:
-            LOGGER.info(f"pycocotools unable to run: {e}")
+        #     anno = COCO(anno_json)  # init annotations api
+        #     pred = anno.loadRes(pred_json)  # init predictions api
+        #     eval = COCOeval(anno, pred, "bbox")
+        #     if is_coco:
+        #         eval.params.imgIds = [int(Path(x).stem) for x in dataloader.dataset.im_files]  # image IDs to evaluate
+        #     eval.evaluate()
+        #     eval.accumulate()
+        #     eval.summarize()
+        #     map, map50 = eval.stats[:2]  # update results (mAP@0.5:0.95, mAP@0.5)
+        # except Exception as e:
+        #     LOGGER.info(f"pycocotools unable to run: {e}")
 
     # Return results
-    model.float()  # for training
-    if not training:
-        s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ""
-        LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
-    maps = np.zeros(nc) + map
-    for i, c in enumerate(ap_class):
-        maps[c] = ap[i]
-    return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
+    # model.float()  # for training
+    # if not training:
+    #     s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ""
+    #     LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
+    # maps = np.zeros(nc) + map
+    # for i, c in enumerate(ap_class):
+    #     maps[c] = ap[i]
+    # return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
 
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, default=ROOT / "data/coco.yaml", help="dataset.yaml path")
-    parser.add_argument("--weights", nargs="+", type=str, 
-                        default=ROOT / "yolov5m.pt", 
-                        # default="/mnt/share_disk/cdd/model_prune/yolov5/yolov5m.pt",
-                        help="model path(s)")
+    parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
+    parser.add_argument("--weights", nargs="+", type=str, default=ROOT / "yolov5s.pt", help="model path(s)")
     parser.add_argument("--batch-size", type=int, default=32, help="batch size")
     parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=640, help="inference size (pixels)")
     parser.add_argument("--conf-thres", type=float, default=0.001, help="confidence threshold")
     parser.add_argument("--iou-thres", type=float, default=0.6, help="NMS IoU threshold")
     parser.add_argument("--max-det", type=int, default=300, help="maximum detections per image")
     parser.add_argument("--task", default="val", help="train, val, test, speed or study")
-    parser.add_argument("--device", default="1", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
+    parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
     parser.add_argument("--workers", type=int, default=8, help="max dataloader workers (per RANK in DDP mode)")
     parser.add_argument("--single-cls", action="store_true", help="treat as single-class dataset")
     parser.add_argument("--augment", action="store_true", help="augmented inference")

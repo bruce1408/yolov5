@@ -1,4 +1,4 @@
-import torch, os
+import os
 from ultralytics import YOLO
 os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 
